@@ -1,0 +1,352 @@
+
+================================================================================
+                     CONTRACT AI  —  END-TO-END FLOW
+================================================================================
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  USER  (Browser)                                                             │
+│                                                                              │
+│   [1]  Selects  Policy PDF   (the rules / pricing / tier document)           │
+│   [2]  Selects  Agreement PDF (the service contract to analyse)              │
+│   [3]  Manages  Field list   (chips UI — add / remove field names)           │
+│   [4]  Clicks   "Analyse Document"                                           │
+└───────────────────────────────┬──────────────────────────────────────────────┘
+                                │
+                                │  POST  http://127.0.0.1:8000/analyze/
+                                │  Content-Type: multipart/form-data
+                                │
+                                │  contract_file  →  Agreement PDF bytes
+                                │  policy_file    →  Policy PDF bytes
+                                │  fields         →  '["vendor","monthly_fee",...]'
+                                │
+                                ▼
+================================================================================
+                     BACKEND  —  main.py  (FastAPI)
+================================================================================
+
+  VALIDATION
+  ─────────────────────────────────────────────────────────────────────────────
+  • Both files must end with .pdf
+  • fields must be a non-empty JSON array of strings
+  • Any failure → HTTP 400 with a clear error message
+
+
+  SAVE TO DISK  (temporary)
+  ─────────────────────────────────────────────────────────────────────────────
+  policy_file    →  backend/media/policy_<filename>.pdf
+  contract_file  →  backend/media/contract_<filename>.pdf
+
+  (both files are DELETED in the finally block after processing)
+
+
+                                │
+               ┌────────────────┴────────────────┐
+               │                                 │
+               ▼                                 ▼
+    ── POLICY PATH ──                 ── CONTRACT PATH ──
+
+
+================================================================================
+                     POLICY PATH  —  rag_client.py
+================================================================================
+
+  STEP 1 │ EXTRACT TEXT FROM POLICY PDF
+  ─────────────────────────────────────────────────────────────────────────────
+  extractor.py  (pdfplumber)
+
+  For each page:
+    a) find_tables()
+         → detect table bounding boxes
+         → extract each row as:  "cell1 | cell2 | cell3"
+         → record table bounding boxes
+
+    b) extract_words()
+         → get every word with its (x, y) coordinate
+         → skip any word whose bounding box overlaps a table area
+           (prevents body text duplicating table content)
+         → group words into lines by their top-y coordinate
+
+    c) Sort all fragments (tables + body lines) by top-y position
+       → guarantees correct top-to-bottom reading order
+
+    d) Join fragments per page  →  join pages with double newline
+
+  Output: one plain-text string of the entire policy PDF
+
+
+  STEP 2 │ CHUNK THE TEXT
+  ─────────────────────────────────────────────────────────────────────────────
+  LangChain  RecursiveCharacterTextSplitter
+    chunk_size    = 2000 characters
+    chunk_overlap = 400  characters
+
+  Output: chunks[]  (list of overlapping text windows)
+
+
+  STEP 3 │ EMBED EACH CHUNK
+  ─────────────────────────────────────────────────────────────────────────────
+  sentence-transformers   model: all-MiniLM-L6-v2
+    Input : chunk text string
+    Output: 384-dimensional float vector
+
+  Output: vectors[]  (one vector per chunk)
+
+
+  STEP 4 │ INDEX INTO QDRANT
+  ─────────────────────────────────────────────────────────────────────────────
+  Qdrant  (local file-based at  backend/qdrant_data/)
+  collection: "conditions_base"   distance: COSINE
+
+    1. DELETE existing collection   ← fresh index every run, no stale data
+    2. CREATE new empty collection
+    3. UPSERT all points:
+         id      = random UUID
+         vector  = 384-dim embedding
+         payload = { "text": chunk_text, "chunk_index": i }
+
+  Output: N chunks indexed ("Indexed N chunks into Qdrant.")
+
+
+================================================================================
+                     CONTRACT PATH  —  extractor.py
+================================================================================
+
+  STEP 5 │ EXTRACT TEXT FROM AGREEMENT PDF
+  ─────────────────────────────────────────────────────────────────────────────
+  Same pdfplumber pipeline as Step 1 (find_tables + extract_words + sort)
+
+  Output: contract_text  (plain string)
+
+  If empty → HTTP 400  "Could not extract text from the agreement PDF"
+
+
+================================================================================
+                     LLM PIPELINE  —  llm_client.py
+================================================================================
+
+  STEP 6 │ RAG QUERY  —  retrieve relevant policy chunks
+  ─────────────────────────────────────────────────────────────────────────────
+  For every field name the user typed:
+
+    field_name  →  embed("monthly fee")  →  384-dim query vector
+                →  Qdrant cosine search  →  top-4 most similar chunks
+                →  deduplicate across all fields (by first 100 chars)
+
+  All unique chunks joined:
+    chunk_A
+    ---
+    chunk_B
+    ---
+    chunk_C
+    ...
+
+  Output: conditions_context  (focused policy excerpt, not the full PDF)
+
+
+  STEP 7 │ BUILD DYNAMIC PYDANTIC SCHEMA
+  ─────────────────────────────────────────────────────────────────────────────
+  For each field key  (sanitized: lowercase + underscores):
+
+    field_key            : Optional[str]
+    field_key_reasoning  : Optional[str]
+
+  pydantic.create_model()  assembles these at runtime into  DynamicSchema
+  LangChain  .with_structured_output(DynamicSchema)  wraps the LLM
+  → guarantees the LLM response is valid JSON matching the schema
+
+
+  STEP 8 │ SINGLE LLM CALL  —  extract + enforce policy
+  ─────────────────────────────────────────────────────────────────────────────
+  Model   : gemma-4-31b-it  via  langchain-google-genai
+  Temp    : 0.0  (deterministic, no randomness)
+  Retries : up to 3 attempts on failure
+
+  EXTRACTION_PROMPT  sends three inputs:
+
+    {field_definitions}   →  list of fields + sanitized keys
+    {contract_text}       →  agreement PDF text (max 12,000 chars)
+    {conditions_context}  →  RAG-retrieved policy chunks
+
+  ──────────────────────────────────────────────────────
+  Inside the LLM  —  4-phase reasoning:
+  ──────────────────────────────────────────────────────
+
+  PHASE 1 │ UNDERSTAND THE POLICY STRUCTURE
+    • Read the policy chunks
+    • Detect if there is a tier / level / band table
+    • Identify every column header
+    • Determine the PRIMARY matching column:
+        - Has a MONTH column?        →  match by month
+        - Has a FEE column only?     →  match by uptime
+        - Uptime + tier name only?   →  match by uptime
+        - No tier table?             →  no tier matching, use rules only
+
+  PHASE 2 │ UNDERSTAND THE CONTRACT
+    • Read the full contract text
+    • Identify: effective date, uptime %, monthly fee, party names,
+      payment terms, durations, penalties — whatever the contract contains
+
+  PHASE 3 │ MATCH THE CORRECT POLICY TIER / RULE
+    • Using the primary matching column from Phase 1:
+        Month-based  → find tier whose month = contract's effective month
+        Uptime-based → find tier whose uptime % is closest to contract's uptime %
+    • Record ALL values from the matched tier row
+      (tier name, uptime, fee, penalty, month, etc.)
+
+  PHASE 4 │ EXTRACT EVERY REQUESTED FIELD
+    For each field — priority order:
+
+    Priority 1  POLICY AUTHORITY  (highest)
+      Is this field governed by the matched tier or a policy rule?
+      → YES: use the POLICY value — override the contract value
+
+    Priority 2  CONTRACT CONTENT
+      Search the contract semantically for what this field means
+      → Found: extract exactly as written (strip currency symbols + commas)
+
+    Priority 3  POLICY DEFAULT
+      Does the policy provide a default / fallback for this field?
+      → YES: use the policy default
+
+    Priority 4  NOT FOUND
+      → Return null
+
+    Reasoning  (≤ 15 words, one of):
+      "Extracted from contract"
+      "Policy override — <brief reason>"
+      "Inferred from policy — <brief reason>"
+      "Not found"
+
+  ──────────────────────────────────────────────────────
+  LLM Output  (validated against DynamicSchema):
+  ──────────────────────────────────────────────────────
+
+  {
+    "vendor":             "Acme Corp",
+    "vendor_reasoning":   "Extracted from contract",
+    "monthly_fee":        "150000",
+    "monthly_fee_reasoning": "Policy override — Tier 3 requires 150000",
+    "minimum_uptime":     "93.3",
+    "minimum_uptime_reasoning": "Policy override — matched Tier 3",
+    ...
+  }
+
+
+  STEP 9 │ RESHAPE OUTPUT
+  ─────────────────────────────────────────────────────────────────────────────
+  {
+    "vendor":         { "value": "Acme Corp",  "reasoning": "Extracted from contract" },
+    "monthly_fee":    { "value": "150000",     "reasoning": "Policy override — Tier 3 requires 150000" },
+    "minimum_uptime": { "value": "93.3",       "reasoning": "Policy override — matched Tier 3" },
+    "penalty_percent":{ "value": "10",         "reasoning": "Inferred from policy — linked to Tier 3" },
+    "start_date":     { "value": "2026-08-01", "reasoning": "Extracted from contract" },
+    "evaluation_period":{ "value": null,       "reasoning": "Not found" }
+  }
+
+
+================================================================================
+                     RESPONSE  —  FastAPI  →  Browser
+================================================================================
+
+  STEP 10 │ CLEANUP + RETURN
+  ─────────────────────────────────────────────────────────────────────────────
+  • Temp files deleted:  media/policy_*.pdf  and  media/contract_*.pdf
+  • FastAPI returns  JSONResponse(content=extracted_data)
+  • On total failure:  { "error": "Extraction failed after 3 attempts" }
+
+
+================================================================================
+                     FRONTEND  —  App.jsx  (React)
+================================================================================
+
+  STEP 11 │ RENDER RESULT CARDS
+  ─────────────────────────────────────────────────────────────────────────────
+  For each field in the response:
+
+    ┌──────────────────────────────────────────┐
+    │  Field Label                             │
+    │  Value                                  │
+    │  [reasoning badge]                       │
+    └──────────────────────────────────────────┘
+
+  Badge colour logic  (getReasonType):
+
+    reasoning starts with "Extracted from contract"  →  GREEN  badge
+    reasoning starts with "Policy override"          →  ORANGE badge  + card border
+    reasoning starts with "Inferred from policy"     →  BLUE   badge  + card border
+    reasoning starts with "Not found"                →  GREY   badge
+
+  Legend row above the grid explains the four badge types.
+  Header shows total field count extracted.
+
+
+================================================================================
+                     DATA FLOW  —  SUMMARY DIAGRAM
+================================================================================
+
+  Browser
+    |
+    |-- POST /analyze/ ---------------------------------------------------------
+    |
+    v
+  FastAPI (main.py)
+    |-- validate files + fields
+    |-- save to /media/
+    |
+    |-- rag_client.index_conditions_pdf(policy)
+    |       |-- extractor.extract_text_from_pdf()    [pdfplumber]
+    |       |-- TextSplitter -> chunks[]
+    |       |-- SentenceTransformer.encode() -> vectors[]
+    |       |-- Qdrant: delete + create + upsert     [fresh every run]
+    |
+    |-- extractor.extract_text_from_pdf(contract) -> contract_text
+    |
+    |-- llm_client.extract_contract_data(contract_text, fields)
+    |       |-- rag_client.query_conditions(fields) -> conditions_context
+    |       |-- _make_schema(fields) -> DynamicPydanticModel
+    |       |-- EXTRACTION_PROMPT | llm.with_structured_output(DynamicSchema)
+    |       |       |-- Phase 1: understand policy structure
+    |       |       |-- Phase 2: read contract facts
+    |       |       |-- Phase 3: match tier / rule
+    |       |       |-- Phase 4: extract + enforce each field
+    |       |-- reshape raw -> {field: {value, reasoning}}
+    |
+    |-- delete /media/ temp files
+    |-- return JSONResponse
+    |
+    v
+  Browser (App.jsx)
+    |-- render colour-coded result cards
+    |-- green / orange / blue / grey badges per field
+
+
+================================================================================
+                     KEY DESIGN NOTES
+================================================================================
+
+  Re-index every run     The policy collection is deleted and rebuilt fresh on
+                         each request so a new policy PDF never mixes with a
+                         previous one.
+
+  RAG per field          Only the top-4 most relevant chunks per field are
+                         retrieved from Qdrant and sent to the LLM — not the
+                         full policy text. Keeps the prompt focused and within
+                         context limits.
+
+  No hardcoding          The prompt has zero assumptions about column names,
+                         field synonyms, or policy structure. The LLM reads the
+                         actual documents and reasons about their structure.
+                         Works for any PDF layout or tier design.
+
+  Dynamic schema         create_model() builds a Pydantic class at runtime from
+                         whatever field names the user typed. The LLM is forced
+                         to return valid JSON matching that schema.
+
+  Temperature 0          Fully deterministic. Same documents always produce the
+                         same result.
+
+  Temp file cleanup      Both uploaded PDFs are deleted after every request.
+                         No user data is stored on disk.
+
+================================================================================

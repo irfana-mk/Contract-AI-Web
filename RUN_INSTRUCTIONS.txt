@@ -1,0 +1,165 @@
+================================================================
+         CONTRACT AI EXTRACTOR — COMPLETE GUIDE
+================================================================
+Stack: FastAPI · Google Gemma 4 31B · Qdrant · React + Vite
+================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  HOW IT WORKS — FULL PIPELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+PHASE A — SERVER STARTUP (runs once, automatically)
+─────────────────────────────────────────────────────
+1. Reads  backend/data/UC1_RAG_Pricing_Matrix_1.pdf
+         (this is the POLICY file — pricing tiers, uptime rules, penalties)
+
+2. Splits the policy text into chunks (~2000 chars each)
+
+3. Converts each chunk into a 384-number vector using
+   the all-MiniLM-L6-v2 embedding model
+
+4. Stores all vectors + text in Qdrant (backend/qdrant_data/)
+   under a collection called "conditions_base"
+
+   Result: Qdrant now holds your policy knowledge, ready to search.
+
+PHASE B — WHEN YOU UPLOAD A CONTRACT PDF
+─────────────────────────────────────────────────────
+Step 1 │ TEXT EXTRACTION
+       │  pdfplumber reads every page of the uploaded PDF
+       │  Tables are extracted separately as structured rows
+       │  Output: plain text of the full contract
+
+Step 2 │ RAG LOOKUP (Qdrant)
+       │  Query: "pricing tiers penalties uptime SLA"
+       │  → Query is embedded into a vector
+       │  → Vector compared against all policy chunks in Qdrant
+       │  → Top 4 most similar policy chunks returned
+       │  Output: relevant policy context (tier fees, uptime rules, penalties)
+
+Step 3 │ LLM EXTRACTION (Gemma 4 31B via Google AI)
+       │  Prompt = Contract Text + Policy Context
+       │  Gemma reads both and extracts:
+       │   • contract_type, vendor, client, start_date
+       │   • payment_window, billing_day, evaluation_period
+       │   • monthly_fee (raw number from document)
+       │   • bonus_percent, target_uptime_percent
+       │  Output: JSON with extracted field values
+
+Step 4 │ TIER OVERRIDE (programmatic — guaranteed accurate)
+       │  Takes the extracted monthly_fee and finds closest policy tier:
+       │   ₹35,000  → Standard ETL Pipelines       (99.0% uptime)
+       │   ₹78,000  → Advanced Agentic Workflows    (99.5% uptime)
+       │   ₹1,50,000→ Mission-Critical Architecture (99.9%, 15% penalty)
+       │  Overrides: monthly_fee, service_tier,
+       │             minimum_uptime_percent, penalty_percent
+       │  Output: Final corrected JSON
+
+Step 5 │ RESPONSE
+       │  JSON sent to frontend → fields displayed in the UI
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  FOLDER STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+contract-ai/
+├── backend/
+│   ├── main.py          → FastAPI server, API endpoints
+│   ├── extractor.py     → PDF text + table extraction (pdfplumber)
+│   ├── llm_client.py    → Gemma 4 31B prompt + tier override logic
+│   ├── rag_client.py    → Qdrant indexing + semantic search
+│   ├── schema.py        → Pydantic output schemas
+│   ├── requirements.txt → Python dependencies
+│   ├── data/
+│   │   └── UC1_RAG_Pricing_Matrix_1.pdf  ← POLICY FILE (auto-loaded)
+│   ├── qdrant_data/     → Qdrant vector DB (created on first run)
+│   └── media/           → Temp upload folder (auto-cleaned)
+└── frontend/
+    └── src/
+        ├── App.jsx      → React UI
+        └── index.css    → Styles
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STEP 1 — FIRST TIME SETUP (run once)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Open a terminal and run:
+
+  cd "/Users/irfana/Desktop/contract-ai copy/backend"
+  python3 -m venv venv
+  source venv/bin/activate
+  pip install -r requirements.txt
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STEP 2 — START THE BACKEND
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+In the same terminal (venv must be active):
+
+  export GOOGLE_API_KEY="your-api-key-here"
+  python3 -m uvicorn main:app --reload --port 8000
+
+  ✅ You will see:
+     "Pre-loading sentence transformer..."
+     "Auto-loading default conditions: .../data/UC1_RAG_Pricing_Matrix_1.pdf"
+     "Indexed N chunks into Qdrant."
+     "Uvicorn running on http://127.0.0.1:80
+
+  IMPORTANT: Always use  python3 -m uvicorn  (not just uvicorn)
+             to ensure it runs inside the venv.
+
+  Get your API key from: https://aistudio.google.com/app/apikey
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STEP 3 — START THE FRONTEND
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Open a NEW terminal window:
+
+  cd "/Users/irfana/Desktop/contract-ai copy/frontend"
+  npm run dev
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  STEP 4 — USE THE APP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Open in browser:  http://localhost:5173
+
+  1. Click "Select PDF Document" and choose a contract PDF
+  2. Click "Analyze Document"
+  3. Wait ~10-20 seconds (Gemma 4 31B processes the document)
+  4. All extracted fields appear in the grid below
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  NOTES & TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• API docs (Swagger UI): http://127.0.0.1:8000/docs
+
+• If you see "Address already in use":
+    lsof -ti:8000 | xargs kill -9
+
+• If you see "Qdrant already accessed by another instance":
+    Only ONE uvicorn process can run at a time.
+    Kill all old processes first, then restart.
+
+• To change the model:
+    export GEMINI_MODEL="gemma-4-31b-it"
+
+• The qdrant_data/ folder is created automatically on first run.
+  It persists between restarts — policy chunks stay indexed.
+
+• Uploaded contract PDFs are deleted automatically after processing.
+
+• To update the policy/pricing rules:
+    Replace backend/data/UC1_RAG_Pricing_Matrix_1.pdf
+    then restart the server — it will re-index automatically.
+
+================================================================
